@@ -4,7 +4,8 @@
             [korma.sql.utils :as utils]
             [clojure.set :as set]
             [korma.db :as db])
-  (:use [korma.sql.engine :only [bind-query bind-params]]))
+  (:use [clojure.algo.monads]
+        [korma.sql.engine :only [bind-query bind-params]]))
 
 (def ^{:dynamic true} *exec-mode* false)
 (declare get-rel)
@@ -371,15 +372,18 @@
 
 (defn create-entity
   "Create an entity representing a table in a database."
-  [table]
-  {:table table
-   :name table
-   :pk :id
-   :db nil
-   :transforms '()
-   :prepares '()
-   :fields []
-   :rel {}}) 
+  [table & body]
+  (let [new-ent {:table (name table)
+                 :name (name table)
+                 :pk :id
+                 :db nil
+                 :transforms '()
+                 :prepares '()
+                 :fields []
+                 :rel {}}
+        body-fn (with-monad state-m
+                            (m-seq body))]
+    (second (body-fn new-ent)))) 
 
 (defn create-relation
   "Create a relation map describing how two entities are related."
@@ -405,16 +409,12 @@
 
 (defn rel
   [ent sub-ent type opts]
-  (let [var-name (-> sub-ent meta :name)
-        cur-ns *ns*]
-    (assoc-in ent [:rel (name var-name)]
-              (delay 
-                (let [resolved (ns-resolve cur-ns var-name)
-                      sub-ent (when resolved
-                                (deref sub-ent))]
-                  (when-not (map? sub-ent)
-                    (throw (Exception. (format "Entity used in relationship does not exist: %s" (name var-name)))))
-                  (create-relation ent sub-ent type opts))))))
+  (let [var-name (:name sub-ent)]
+    (when-not (map? sub-ent)
+      (throw (Exception. (format "Entity used in relationship does not exist: %s"
+                                 var-name))))
+    [nil (assoc-in ent [:rel var-name]
+                   (create-relation ent sub-ent type opts))]))
 
 (defn get-rel [ent sub-ent]
   (let [sub-name (if (map? sub-ent)
@@ -422,32 +422,35 @@
                    sub-ent)]
     (force (get-in ent [:rel sub-name]))))
 
-(defmacro has-one
+(defn has-one
   "Add a has-one relationship for the given entity. It is assumed that the foreign key
   is on the sub-entity with the format table_id: user.id = address.user_id
   Opts can include a key for :fk to explicitly set the foreign key.
   
   (has-one users address {:fk :addressID})"
-  [ent sub-ent & [opts]]
-  `(rel ~ent (var ~sub-ent) :has-one ~opts))
+  [sub-ent & [opts]]
+  (fn [ent]
+    (rel ent sub-ent :has-one opts)))
 
-(defmacro belongs-to
+(defn belongs-to
   "Add a belongs-to relationship for the given entity. It is assumed that the foreign key
   is on the current entity with the format sub-ent-table_id: email.user_id = user.id.
   Opts can include a key for :fk to explicitly set the foreign key.
   
   (belongs-to users email {:fk :emailID})"
-  [ent sub-ent & [opts]]
-  `(rel ~ent (var ~sub-ent) :belongs-to ~opts))
+  [sub-ent & [opts]]
+  (fn [ent]
+    (rel ent sub-ent :belongs-to opts)))
 
-(defmacro has-many
+(defn has-many
   "Add a has-many relation for the given entity. It is assumed that the foreign key
   is on the sub-entity with the format table_id: user.id = email.user_id
   Opts can include a key for :fk to explicitly set the foreign key.
   
   (has-many users email {:fk :emailID})"
-  [ent sub-ent & [opts]]
-  `(rel ~ent (var ~sub-ent) :has-many ~opts))
+  [sub-ent & [opts]]
+  (fn [ent]
+    (rel ent sub-ent :has-many opts)))
 
 (defn entity-fields
   "Set the fields to be retrieved by default in select queries for the
@@ -458,21 +461,24 @@
 (defn table
   "Set the name of the table and an optional alias to be used for the entity. 
   By default the table is the name of entity's symbol."
-  [ent t & [alias]]
-  (let [ent (assoc ent :table (name t))]
-    (if alias
-      (assoc ent :alias (name alias))
-      ent)))
+  [t & [alias]]
+  (fn [ent]
+    (let [ent (assoc ent :table (name t))]
+       (if alias
+         [nil (assoc ent :alias (name alias))]
+         [nil ent]))))
 
 (defn pk
   "Set the primary key used for an entity. :id by default."
-  [ent pk]
-  (assoc ent :pk (keyword pk)))
+  [pk]
+  (fn [ent]
+    [nil (assoc ent :pk (keyword pk))]))
 
 (defn database
   "Set the database connection to be used for this entity."
-  [ent db]
-  (assoc ent :db db))
+  [db]
+  (fn database-fn [ent]
+    [nil (assoc ent :db db)]))
 
 (defn transform
   "Add a function to be applied to results coming from the database"
@@ -488,9 +494,8 @@
   "Define an entity representing a table in the database, applying any modifications in
   the body."
   [ent & body]
-  `(let [e# (-> (create-entity ~(name ent))
-              ~@body)]
-     (def ~ent e#)))
+  `(def ~ent
+     (create-entity '~ent ~@body)))
 
 ;;*****************************************************
 ;; With
